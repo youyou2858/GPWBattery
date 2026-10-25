@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller 构建产物
+build/
+dist/
+*.spec
+
+# 运行时日志
+GPWBattery-error.log
+
+# 打包产物（通过 Releases 分发）
+*.zip
