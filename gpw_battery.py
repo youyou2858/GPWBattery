@@ -5,13 +5,17 @@ gpw_battery.py —— 罗技 GPW（G PRO Wireless 一代）电量托盘小工具
 特点：
   * 纯 ctypes 调用 Win32，无第三方依赖（只需要 Python 3.9+）
   * 托盘图标实时显示电量（电池图标 + 颜色分级）
-  * 鼠标悬停弹出提示窗，样式仿 Windows 11 原生 tooltip（深色圆角卡片）
-  * 弹窗固定在任务栏上方、不遮挡任务栏；始终置顶、不抢焦点、不出现在 Alt+Tab
+  * 左键点击图标弹出提示窗，样式仿 Windows 11 原生 flyout（深色圆角卡片）
+  * 弹窗以托盘图标为锚点、显示在图标上方，不遮挡任务栏
+  * 右键菜单同样是同款深色圆角卡片（不是系统原生菜单）
+  * 始终置顶、不抢焦点、不出现在 Alt+Tab；点空白处自动收起
 
 运行：
     pythonw gpw_battery.py        # 无控制台窗口
     python  gpw_battery.py --once # 命令行读取一次电量
     python  gpw_battery.py --demo # 用假数据预览弹窗样式（调试用）
+    python  gpw_battery.py --demo --preview       # 只弹左键弹窗，15 秒后退出
+    python  gpw_battery.py --demo --preview-menu  # 只弹右键菜单，15 秒后退出
 """
 
 import ctypes
@@ -25,25 +29,27 @@ from ctypes import wintypes
 import hidpp
 
 # ===================================================================== 常量
+APP_NAME = "GPW Battery"
+FONT_FACE = "Segoe UI"
+
 WM_DESTROY = 0x0002
 WM_CLOSE = 0x0010
 WM_COMMAND = 0x0111
 WM_TIMER = 0x0113
 WM_PAINT = 0x000F
 WM_ERASEBKGND = 0x0014
-WM_NULL = 0x0000
 WM_LBUTTONUP = 0x0202
 WM_RBUTTONUP = 0x0205
 WM_LBUTTONDBLCLK = 0x0203
+WM_MOUSEMOVE = 0x0200
 WM_APP = 0x8000
 WM_CONTEXTMENU = 0x007B
+VK_LBUTTON = 0x01
+VK_RBUTTON = 0x02
 NIN_SELECT = 0x0400
-NIN_POPUPOPEN = 0x0406
-NIN_POPUPCLOSE = 0x0407
 
 WM_TRAY = WM_APP + 1          # 托盘回调消息
 WM_REFRESH_DONE = WM_APP + 2  # 后台线程读完后通知 UI
-WM_MENU_CMD = 0x8003
 
 WS_POPUP = 0x80000000
 WS_EX_TOPMOST = 0x00000008
@@ -54,8 +60,6 @@ WS_EX_NOACTIVATE = 0x08000000
 SW_HIDE = 0
 SW_SHOWNOACTIVATE = 4
 HWND_TOPMOST = -1
-SWP_NOSIZE = 0x0001
-SWP_NOMOVE = 0x0002
 SWP_NOACTIVATE = 0x0010
 SWP_SHOWWINDOW = 0x0040
 
@@ -68,13 +72,6 @@ NIF_ICON = 0x00000002
 NIF_TIP = 0x00000004
 NOTIFYICON_VERSION_4 = 4
 
-TPM_RIGHTBUTTON = 0x0002
-TPM_BOTTOMALIGN = 0x0020
-MF_STRING = 0x00000000
-MF_SEPARATOR = 0x00000800
-MF_CHECKED = 0x00000008
-MF_GRAYED = 0x00000001
-
 ULW_ALPHA = 0x00000002
 AC_SRC_OVER = 0x00
 AC_SRC_ALPHA = 0x01
@@ -84,6 +81,7 @@ DT_LEFT = 0x0000
 DT_SINGLELINE = 0x0020
 DT_NOPREFIX = 0x0800
 DT_CALCRECT = 0x0400
+DT_VCENTER = 0x0004
 TRANSPARENT = 1
 ANTIALIASED_QUALITY = 4
 DEFAULT_CHARSET = 1
@@ -91,14 +89,18 @@ FW_NORMAL = 400
 FW_SEMIBOLD = 600
 
 SM_CXSMICON = 49
-SM_CYSMICON = 50
 MONITOR_DEFAULTTONEAREST = 2
 
 IDI_APPLICATION = 32512
+ERROR_CLASS_ALREADY_EXISTS = 1410
 
-# 配色（仿 Win11 深色 tooltip）
+CARD_GAP = 6      # 卡片与托盘图标的间距
+CARD_EDGE = 4     # 卡片与屏幕/工作区边缘的最小距离
+
+# 配色（仿 Win11 深色卡片）
 CLR_BG = (43, 43, 43)
 CLR_BORDER = (62, 62, 62)
+CLR_HOVER = (58, 58, 58)
 CLR_TITLE = (255, 255, 255)
 CLR_SUB = (206, 206, 206)
 CLR_TRACK = (74, 74, 74)
@@ -444,184 +446,166 @@ def _rounded_alpha(w, h, radius, supersample=4):
     return cov
 
 
-# ===================================================================== 弹窗
-class Popup:
-    """仿 Win11 深色 tooltip 的无边框置顶弹窗（分层窗口 + 逐像素透明）"""
+# ===================================================================== 绘制底座
+class _MemDC:
+    """借一个内存 DC 用来量文字（with 语法，退出时自动释放）"""
 
-    CLASS_NAME = "GPWBatteryPopup"
+    def __enter__(self):
+        self._screen = user32.GetDC(None)
+        self._dc = gdi32.CreateCompatibleDC(self._screen)
+        return self._dc
 
-    def __init__(self, app):
+    def __exit__(self, *exc):
+        gdi32.DeleteDC(self._dc)
+        user32.ReleaseDC(None, self._screen)
+        return False
+
+
+class _Surface:
+    """32 位 DIB 绘制面：画完交给 UpdateLayeredWindow，退出 with 时释放 GDI 资源"""
+
+    def __init__(self, w, h):
+        self.w, self.h = w, h
+        self.hdc_screen = None
+        self.mem = None
+        self.bits = None
+        self._hbm = None
+        self._old_bmp = None
+
+    def __enter__(self):
+        self.hdc_screen = user32.GetDC(None)
+        self.mem = gdi32.CreateCompatibleDC(self.hdc_screen)
+        bmi = BITMAPINFO()
+        bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bmi.bmiHeader.biWidth = self.w
+        bmi.bmiHeader.biHeight = -self.h          # 负高度 = 自上而下
+        bmi.bmiHeader.biPlanes = 1
+        bmi.bmiHeader.biBitCount = 32
+        bmi.bmiHeader.biCompression = 0
+        self.bits = ctypes.c_void_p()
+        self._hbm = gdi32.CreateDIBSection(self.mem, ctypes.byref(bmi), DIB_RGB_COLORS,
+                                           ctypes.byref(self.bits), None, 0)
+        self._old_bmp = gdi32.SelectObject(self.mem, self._hbm)
+        return self
+
+    def __exit__(self, *exc):
+        gdi32.SelectObject(self.mem, self._old_bmp)
+        gdi32.DeleteObject(self._hbm)
+        gdi32.DeleteDC(self.mem)
+        user32.ReleaseDC(None, self.hdc_screen)
+        return False
+
+    def pixels(self):
+        size = self.w * self.h * 4
+        return ctypes.cast(self.bits, ctypes.POINTER(ctypes.c_ubyte * size)).contents
+
+
+class LayeredCard:
+    """
+    Win11 风格圆角卡片的公共底座。
+
+    左键弹窗和右键菜单都是「无边框置顶分层窗口 + GDI 绘制 + 逐像素圆角 alpha」，
+    差别只在画什么。窗口创建、卡片底/描边、圆角合成、贴图标定位、显示隐藏这些
+    共用部分收在这里，子类只要实现 `_measure_size()` / `_paint()` / `_wnd_proc()`。
+    """
+
+    RADIUS = 8          # 卡片圆角（96 DPI 下的像素）
+
+    def __init__(self, app, class_name):
         self.app = app
+        self.class_name = class_name
         self.hwnd = None
         self.visible = False
         self.rect = wintypes.RECT(0, 0, 0, 0)
         self._wndproc_ref = None
         self._dpi = 96
 
-    # -- 创建 ------------------------------------------------------
+    # -- 窗口 ------------------------------------------------------
     def create(self):
         hinst = kernel32.GetModuleHandleW(None)
         self._wndproc_ref = WNDPROC(self._wnd_proc)
         wc = WNDCLASSEXW()
         wc.cbSize = ctypes.sizeof(WNDCLASSEXW)
-        wc.style = 0
         wc.lpfnWndProc = self._wndproc_ref
         wc.hInstance = hinst
-        wc.hCursor = user32.LoadCursorW(None, ctypes.c_void_p(32512))
-        wc.lpszClassName = self.CLASS_NAME
+        wc.hCursor = user32.LoadCursorW(None, ctypes.c_void_p(IDI_APPLICATION))
+        wc.lpszClassName = self.class_name
         user32.RegisterClassExW(ctypes.byref(wc))
         ex = WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST
-        self.hwnd = user32.CreateWindowExW(ex, self.CLASS_NAME, "GPW Battery",
-                                           WS_POPUP, 0, 0, 10, 10,
-                                           None, None, hinst, None)
+        self.hwnd = user32.CreateWindowExW(ex, self.class_name, APP_NAME, WS_POPUP,
+                                           0, 0, 10, 10, None, None, hinst, None)
         return self.hwnd
 
-    def _wnd_proc(self, hwnd, msg, wparam, lparam):
-        if msg == WM_ERASEBKGND:
-            return 1
-        if msg == WM_PAINT:
-            # 内容全部由 UpdateLayeredWindow 绘制
-            return 0
-        if msg == WM_LBUTTONUP:
-            self.app.refresh(force=True)
-            return 0
-        if msg == WM_DESTROY:
-            return 0
-        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
-
-    # -- 绘制 ------------------------------------------------------
+    # -- 尺寸与字体 -------------------------------------------------
     def _scaled(self, v):
         return int(round(v * self._dpi / 96.0))
 
-    def render(self, reading, dpi, paint=True):
-        """按当前数据重绘并更新分层窗口，返回窗口尺寸 (w,h)"""
-        self._dpi = dpi
-        if reading is None:
-            title = "GPW1"
-            sub = "正在读取…"
-            level = None
-            charging = False
-            connected = True
-        else:
-            title = reading.device_name or "GPW1"
-            if reading.error:
-                err = reading.error
-                state = getattr(reading, "state", "")
-                if state == "asleep":
-                    sub = "鼠标休眠 · 移动鼠标唤醒"
-                elif state == "no_receiver":
-                    sub = "接收器无响应 · 请重新插拔"
-                elif "未连接" in err or state == "absent":
-                    sub = "鼠标未连接 · 请打开电源"
-                else:
-                    sub = "未检测到设备"
-                level = None
-                charging = False
-                connected = False
-            else:
-                level = reading.percent
-                charging = reading.charging
-                sub = f"电量 {level}%  ·  {reading.status_text}" if level is not None else "电量未知"
-                connected = True
+    def _font(self, size, weight=FW_NORMAL):
+        return gdi32.CreateFontW(-self._scaled(size), 0, 0, 0, weight, 0, 0, 0,
+                                 DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, FONT_FACE)
 
-        f_title = gdi32.CreateFontW(-self._scaled(15), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0,
-                                    DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, "Segoe UI")
-        f_sub = gdi32.CreateFontW(-self._scaled(13), 0, 0, 0, FW_NORMAL, 0, 0, 0,
-                                  DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, "Segoe UI")
+    @staticmethod
+    def measure(dc, font, text):
+        """单行文字的像素宽度"""
+        old = gdi32.SelectObject(dc, font)
+        rc = wintypes.RECT(0, 0, 0, 0)
+        user32.DrawTextW(dc, text, -1, ctypes.byref(rc),
+                         DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_CALCRECT)
+        gdi32.SelectObject(dc, old)
+        return rc.right - rc.left
 
-        hdc_screen = user32.GetDC(None)
-        tmp = gdi32.CreateCompatibleDC(hdc_screen)
-        pad_x, pad_y = self._scaled(16), self._scaled(13)
-        gap1, gap2 = self._scaled(3), self._scaled(9)
-        bar_h = max(2, self._scaled(3))
-        radius = self._scaled(8)
-
-        tw = self._measure(tmp, f_title, title)
-        sw = self._measure(tmp, f_sub, sub)
-        title_h = self._scaled(20)
-        sub_h = self._scaled(18)
-        w = max(tw, sw, self._scaled(132)) + pad_x * 2
-        h = pad_y * 2 + title_h + gap1 + sub_h + gap2 + bar_h
-
-        if not paint:  # 只量尺寸
-            gdi32.DeleteObject(f_title)
-            gdi32.DeleteObject(f_sub)
-            gdi32.DeleteDC(tmp)
-            user32.ReleaseDC(None, hdc_screen)
-            return w, h
-
-        # 建 DIB
-        bmi = BITMAPINFO()
-        bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-        bmi.bmiHeader.biWidth = w
-        bmi.bmiHeader.biHeight = -h
-        bmi.bmiHeader.biPlanes = 1
-        bmi.bmiHeader.biBitCount = 32
-        bmi.bmiHeader.biCompression = 0
-        bits = ctypes.c_void_p()
-        hbm = gdi32.CreateDIBSection(tmp, ctypes.byref(bmi), DIB_RGB_COLORS,
-                                     ctypes.byref(bits), None, 0)
-        old_bmp = gdi32.SelectObject(tmp, hbm)
-
-        # 背景
+    # -- 绘制基元 ---------------------------------------------------
+    @staticmethod
+    def _draw_card(dc, w, h, radius):
+        """卡片底 + 1px 描边（深色背景上留一圈轮廓）"""
         bg = gdi32.CreateSolidBrush(RGB(*CLR_BG))
-        full = wintypes.RECT(0, 0, w, h)
-        user32.FillRect(tmp, ctypes.byref(full), bg)
+        user32.FillRect(dc, ctypes.byref(wintypes.RECT(0, 0, w, h)), bg)
         gdi32.DeleteObject(bg)
 
-        # 细边框（1px，让深色卡片在深色背景上有轮廓）
         pen = gdi32.CreatePen(0, 1, RGB(*CLR_BORDER))
-        old_pen = gdi32.SelectObject(tmp, pen)
         hollow = gdi32.CreateSolidBrush(RGB(*CLR_BG))
-        old_brush = gdi32.SelectObject(tmp, hollow)
-        gdi32.RoundRect(tmp, 0, 0, w, h, radius * 2, radius * 2)
-        gdi32.SelectObject(tmp, old_pen)
-        gdi32.SelectObject(tmp, old_brush)
+        old_pen = gdi32.SelectObject(dc, pen)
+        old_brush = gdi32.SelectObject(dc, hollow)
+        gdi32.RoundRect(dc, 0, 0, w, h, radius * 2, radius * 2)
+        gdi32.SelectObject(dc, old_pen)
+        gdi32.SelectObject(dc, old_brush)
         gdi32.DeleteObject(pen)
         gdi32.DeleteObject(hollow)
 
-        gdi32.SetBkMode(tmp, TRANSPARENT)
+    @staticmethod
+    def _fill_round(dc, x0, y0, x1, y1, radius, color):
+        brush = gdi32.CreateSolidBrush(RGB(*color))
+        old = gdi32.SelectObject(dc, brush)
+        gdi32.RoundRect(dc, x0, y0, x1, y1, radius * 2, radius * 2)
+        gdi32.SelectObject(dc, old)
+        gdi32.DeleteObject(brush)
 
-        # 标题
-        gdi32.SelectObject(tmp, f_title)
-        gdi32.SetTextColor(tmp, RGB(*CLR_TITLE))
-        rc = wintypes.RECT(pad_x, pad_y, w - pad_x, pad_y + title_h)
-        user32.DrawTextW(tmp, title, -1, ctypes.byref(rc),
-                         DT_LEFT | DT_SINGLELINE | DT_NOPREFIX)
+    @staticmethod
+    def _hline(dc, x0, x1, y, color=CLR_BORDER):
+        pen = gdi32.CreatePen(0, 1, RGB(*color))
+        old = gdi32.SelectObject(dc, pen)
+        gdi32.MoveToEx(dc, x0, y, None)
+        gdi32.LineTo(dc, x1, y)
+        gdi32.SelectObject(dc, old)
+        gdi32.DeleteObject(pen)
 
-        # 副标题
-        gdi32.SelectObject(tmp, f_sub)
-        gdi32.SetTextColor(tmp, RGB(*CLR_SUB))
-        rc = wintypes.RECT(pad_x, pad_y + title_h + gap1, w - pad_x,
-                           pad_y + title_h + gap1 + sub_h)
-        user32.DrawTextW(tmp, sub, -1, ctypes.byref(rc),
-                         DT_LEFT | DT_SINGLELINE | DT_NOPREFIX)
+    def _check_mark(self, dc, x, cy, color=CLR_TITLE):
+        """两段折线勾：比字体里的 ✓ 更接近 Win11 的粗细和比例"""
+        s = self._scaled
+        pen = gdi32.CreatePen(0, max(1, s(1.5)), RGB(*color))
+        old = gdi32.SelectObject(dc, pen)
+        gdi32.MoveToEx(dc, x, cy, None)
+        gdi32.LineTo(dc, x + s(4), cy + s(4))
+        gdi32.LineTo(dc, x + s(11), cy - s(5))
+        gdi32.SelectObject(dc, old)
+        gdi32.DeleteObject(pen)
 
-        # 电量条
-        bar_x0, bar_y0 = pad_x, h - pad_y - bar_h
-        bar_x1 = w - pad_x
-        track = gdi32.CreateSolidBrush(RGB(*CLR_TRACK))
-        old_b = gdi32.SelectObject(tmp, track)
-        gdi32.RoundRect(tmp, bar_x0, bar_y0, bar_x1, bar_y0 + bar_h, bar_h, bar_h)
-        gdi32.SelectObject(tmp, old_b)
-        gdi32.DeleteObject(track)
-        if connected and level:
-            if charging:
-                color = CLR_CHARGE
-            else:
-                color = CLR_OK if level > 50 else (CLR_MID if level > 20 else CLR_LOW)
-            fill = gdi32.CreateSolidBrush(RGB(*color))
-            old_b = gdi32.SelectObject(tmp, fill)
-            fw = bar_x0 + max(bar_h, int(round((bar_x1 - bar_x0) * min(100, level) / 100.0)))
-            gdi32.RoundRect(tmp, bar_x0, bar_y0, fw, bar_y0 + bar_h, bar_h, bar_h)
-            gdi32.SelectObject(tmp, old_b)
-            gdi32.DeleteObject(fill)
-
-        gdi32.GdiFlush()
-
-        # 逐像素圆角 alpha
+    @staticmethod
+    def _round_alpha(surf, radius):
+        """把矩形 DIB 的四角抹成透明，边缘按覆盖率做 alpha 过渡"""
+        w, h = surf.w, surf.h
         cov = _rounded_alpha(w, h, radius)
-        buf = ctypes.cast(bits, ctypes.POINTER(ctypes.c_ubyte * (w * h * 4))).contents
+        buf = surf.pixels()
         for idx in range(w * h):
             a = cov[idx]
             o = idx * 4
@@ -635,38 +619,19 @@ class Popup:
                 buf[o + 2] = buf[o + 2] * a // 255
                 buf[o + 3] = a
 
-        # 更新分层窗口
+    def _present(self, surf):
+        """推到屏幕：UpdateLayeredWindow 同时负责定位与 alpha 合成"""
         dst = wintypes.POINT(self.rect.left, self.rect.top)
         src = wintypes.POINT(0, 0)
-        size = wintypes.SIZE(w, h)
+        size = wintypes.SIZE(surf.w, surf.h)
         blend = BLENDFUNCTION(AC_SRC_OVER, 0, 255, AC_SRC_ALPHA)
-        user32.UpdateLayeredWindow(self.hwnd, hdc_screen, ctypes.byref(dst),
-                                   ctypes.byref(size), tmp, ctypes.byref(src), 0,
+        user32.UpdateLayeredWindow(self.hwnd, surf.hdc_screen, ctypes.byref(dst),
+                                   ctypes.byref(size), surf.mem, ctypes.byref(src), 0,
                                    ctypes.byref(blend), ULW_ALPHA)
 
-        gdi32.SelectObject(tmp, old_bmp)
-        gdi32.DeleteObject(hbm)
-        gdi32.DeleteDC(tmp)
-        user32.ReleaseDC(None, hdc_screen)
-        gdi32.DeleteObject(f_title)
-        gdi32.DeleteObject(f_sub)
-        return w, h
-
-    @staticmethod
-    def _measure(dc, font, text):
-        old = gdi32.SelectObject(dc, font)
-        rc = wintypes.RECT(0, 0, 0, 0)
-        user32.DrawTextW(dc, text, -1, ctypes.byref(rc),
-                         DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_CALCRECT)
-        gdi32.SelectObject(dc, old)
-        return rc.right - rc.left
-
-    # -- 显示 / 隐藏 -----------------------------------------------
-    def show_at(self, anchor, reading, dpi, align="center"):
-        """anchor 为托盘图标屏幕矩形，弹窗显示在它上方（不压任务栏）"""
-        # 先量尺寸
-        w, h = self.render(reading, dpi, paint=False)
-
+    # -- 定位与显隐 -------------------------------------------------
+    def _place(self, anchor, w, h, align="center"):
+        """贴在 anchor 正上方；越界夹回工作区，任务栏在上方时改到下方"""
         mi = MONITORINFO()
         mi.cbSize = ctypes.sizeof(MONITORINFO)
         hmon = user32.MonitorFromRect(ctypes.byref(anchor), MONITOR_DEFAULTTONEAREST)
@@ -675,27 +640,27 @@ class Popup:
 
         if align == "right":
             x = anchor.right - w
+        elif align == "left":
+            x = anchor.left
         else:
             x = (anchor.left + anchor.right) // 2 - w // 2
-        gap = self._scaled(6)
-        # 任务栏在下方：图标顶部即任务栏上沿附近，向上弹出
-        y = min(anchor.top, work.bottom) - h - gap
-        if y < work.top + 4:  # 任务栏在上方 / 垂直任务栏
-            y = max(work.top + 4, min(anchor.bottom + gap, work.bottom - h - 4))
-        x = max(work.left + 4, min(x, work.right - w - 4))
-        y = max(work.top + 4, min(y, work.bottom - h - 4))
 
-        self.rect = wintypes.RECT(x, y, x + w, y + h)
-        user32.SetWindowPos(self.hwnd, HWND_TOPMOST, x, y, w, h,
+        gap, edge = self._scaled(CARD_GAP), CARD_EDGE
+        y = min(anchor.top, work.bottom) - h - gap
+        if y < work.top + edge:
+            y = min(anchor.bottom + gap, work.bottom - h - edge)
+        x = max(work.left + edge, min(x, work.right - w - edge))
+        y = max(work.top + edge, min(y, work.bottom - h - edge))
+        return wintypes.RECT(x, y, x + w, y + h)
+
+    def _show(self, rect):
+        self.rect = rect
+        user32.SetWindowPos(self.hwnd, HWND_TOPMOST, rect.left, rect.top,
+                            rect.right - rect.left, rect.bottom - rect.top,
                             SWP_NOACTIVATE | SWP_SHOWWINDOW)
-        # 位置确定后再画一次，保证 UpdateLayeredWindow 使用正确坐标
-        self.render(reading, dpi)
+        self._paint()
         user32.ShowWindow(self.hwnd, SW_SHOWNOACTIVATE)
         self.visible = True
-
-    def refresh_content(self, reading, dpi):
-        if self.visible:
-            self.render(reading, dpi)
 
     def hide(self):
         if self.visible:
@@ -703,17 +668,326 @@ class Popup:
             self.visible = False
 
     def contains(self, pt):
+        """点是否落在卡片矩形内（用于「点空白处收起」）"""
         if not self.visible:
             return False
         return (self.rect.left <= pt.x < self.rect.right and
                 self.rect.top <= pt.y < self.rect.bottom)
 
+    # -- 子类实现 ---------------------------------------------------
+    def _measure_size(self):
+        raise NotImplementedError
+
+    def _paint(self):
+        raise NotImplementedError
+
+    def _wnd_proc(self, hwnd, msg, wparam, lparam):
+        raise NotImplementedError
+
+
+# ===================================================================== 左键弹窗
+class Popup(LayeredCard):
+    """仿 Win11 flyout 的电量卡片：设备名 + 电量状态 + 电量条"""
+
+    def __init__(self, app):
+        super().__init__(app, "GPWBatteryPopup")
+        self._content = ("", "", None, False, True)
+
+    def _wnd_proc(self, hwnd, msg, wparam, lparam):
+        if msg == WM_ERASEBKGND:
+            return 1
+        if msg == WM_PAINT:
+            return 0                      # 内容全部由 UpdateLayeredWindow 画
+        if msg == WM_LBUTTONUP:
+            self.app.refresh()
+            return 0
+        if msg == WM_RBUTTONUP:
+            self.hide()                   # 右键点卡片本身也收起
+            return 0
+        if msg == WM_DESTROY:
+            return 0
+        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    # -- 内容 ------------------------------------------------------
+    @staticmethod
+    def describe(reading):
+        """把一次电量读数翻译成 (标题, 副标题, 电量, 充电中, 已连接)"""
+        if reading is None:
+            return ("GPW1", "正在读取…", None, False, True)
+
+        title = reading.device_name or "GPW1"
+        if not reading.error:
+            level = reading.percent
+            sub = (f"电量 {level}%  ·  {reading.status_text}"
+                   if level is not None else "电量未知")
+            return (title, sub, level, reading.charging, True)
+
+        state = getattr(reading, "state", "")
+        if state == "asleep":
+            sub = "鼠标休眠 · 移动鼠标唤醒"
+        elif state == "no_receiver":
+            sub = "接收器无响应 · 请重新插拔"
+        elif state == "absent" or "未连接" in reading.error:
+            sub = "鼠标未连接 · 请打开电源"
+        else:
+            sub = "未检测到设备"
+        return (title, sub, None, False, False)
+
+    def _metrics(self):
+        s = self._scaled
+        return {
+            "pad_x": s(16), "pad_y": s(13),
+            "gap1": s(3), "gap2": s(9),
+            "title_h": s(20), "sub_h": s(18),
+            "bar_h": max(2, s(3)),
+        }
+
+    def _measure_size(self):
+        m = self._metrics()
+        f_title, f_sub = self._font(15, FW_SEMIBOLD), self._font(13)
+        with _MemDC() as dc:
+            tw = self.measure(dc, f_title, self._content[0])
+            sw = self.measure(dc, f_sub, self._content[1])
+        gdi32.DeleteObject(f_title)
+        gdi32.DeleteObject(f_sub)
+        w = max(tw, sw, self._scaled(132)) + m["pad_x"] * 2
+        h = (m["pad_y"] * 2 + m["title_h"] + m["gap1"] + m["sub_h"]
+             + m["gap2"] + m["bar_h"])
+        return w, h
+
+    def _paint(self):
+        w = self.rect.right - self.rect.left
+        h = self.rect.bottom - self.rect.top
+        if w <= 0 or h <= 0:
+            return
+        m = self._metrics()
+        radius = self._scaled(self.RADIUS)
+        title, sub, level, charging, connected = self._content
+        f_title, f_sub = self._font(15, FW_SEMIBOLD), self._font(13)
+
+        with _Surface(w, h) as surf:
+            dc = surf.mem
+            self._draw_card(dc, w, h, radius)
+            gdi32.SetBkMode(dc, TRANSPARENT)
+
+            gdi32.SelectObject(dc, f_title)
+            gdi32.SetTextColor(dc, RGB(*CLR_TITLE))
+            user32.DrawTextW(dc, title, -1, ctypes.byref(wintypes.RECT(
+                m["pad_x"], m["pad_y"],
+                w - m["pad_x"], m["pad_y"] + m["title_h"])),
+                DT_LEFT | DT_SINGLELINE | DT_NOPREFIX)
+
+            gdi32.SelectObject(dc, f_sub)
+            gdi32.SetTextColor(dc, RGB(*CLR_SUB))
+            top = m["pad_y"] + m["title_h"] + m["gap1"]
+            user32.DrawTextW(dc, sub, -1, ctypes.byref(wintypes.RECT(
+                m["pad_x"], top, w - m["pad_x"], top + m["sub_h"])),
+                DT_LEFT | DT_SINGLELINE | DT_NOPREFIX)
+
+            self._draw_bar(dc, m["pad_x"], h - m["pad_y"] - m["bar_h"],
+                           w - m["pad_x"], m["bar_h"], level, charging, connected)
+
+            gdi32.GdiFlush()
+            self._round_alpha(surf, radius)
+            self._present(surf)
+
+        gdi32.DeleteObject(f_title)
+        gdi32.DeleteObject(f_sub)
+
+    def _draw_bar(self, dc, x0, y0, x1, h, level, charging, connected):
+        self._fill_round(dc, x0, y0, x1, y0 + h, h // 2, CLR_TRACK)
+        if not (connected and level):
+            return
+        if charging:
+            color = CLR_CHARGE
+        elif level > 50:
+            color = CLR_OK
+        elif level > 20:
+            color = CLR_MID
+        else:
+            color = CLR_LOW
+        right = x0 + max(h, int(round((x1 - x0) * min(100, level) / 100.0)))
+        self._fill_round(dc, x0, y0, right, y0 + h, h // 2, color)
+
+    # -- 对外 ------------------------------------------------------
+    def show_at(self, anchor, reading, dpi, align="center"):
+        self._dpi = dpi
+        self._content = self.describe(reading)
+        self._show(self._place(anchor, *self._measure_size(), align=align))
+
+    def refresh_content(self, reading, dpi):
+        """数据变了就地重绘；尺寸变化时保持底边和水平中心不动"""
+        if not self.visible:
+            return
+        self._dpi = dpi
+        self._content = self.describe(reading)
+        w, h = self._measure_size()
+        if (w, h) == (self.rect.right - self.rect.left,
+                      self.rect.bottom - self.rect.top):
+            self._paint()
+            return
+        cx = (self.rect.left + self.rect.right) // 2
+        bottom = self.rect.bottom
+        self._show(wintypes.RECT(cx - w // 2, bottom - h, cx - w // 2 + w, bottom))
+
+
+# ===================================================================== 右键菜单
+class MenuPopup(LayeredCard):
+    """
+    与左键弹窗同风格的自绘右键菜单。
+
+    系统的 TrackPopupMenu 画的是经典 Win32 菜单（浅色、直角、系统字体），
+    和 Win11 卡片摆在一起很违和，所以这里用同一套底座自己画。
+    """
+
+    def __init__(self, app):
+        super().__init__(app, "GPWBatteryMenu")
+        self.items = []          # [(kind, label, cmd, checked)]，kind: "item" / "sep"
+        self._hover = -1
+        self._rows = []          # [(y0, y1, index)] 客户区坐标
+        self._pad_x = 0
+        self._width = 0
+
+    def _wnd_proc(self, hwnd, msg, wparam, lparam):
+        if msg == WM_ERASEBKGND:
+            return 1
+        if msg == WM_PAINT:
+            return 0
+        if msg == WM_MOUSEMOVE:
+            self._set_hover(self._hit(*self._client_xy(lparam)))
+            return 0
+        if msg == WM_LBUTTONUP:
+            item = self._item(self._hit(*self._client_xy(lparam)))
+            self.hide()
+            if item is not None:
+                self.app._on_menu_command(item[2])
+            return 0
+        if msg == WM_RBUTTONUP:
+            self.hide()
+            return 0
+        if msg == WM_DESTROY:
+            return 0
+        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    # -- 命中测试 ---------------------------------------------------
+    @staticmethod
+    def _client_xy(lparam):
+        return (ctypes.c_short(lparam & 0xFFFF).value,
+                ctypes.c_short((lparam >> 16) & 0xFFFF).value)
+
+    def _item(self, idx):
+        return self.items[idx] if 0 <= idx < len(self.items) else None
+
+    def _hit(self, x, y):
+        """
+        客户区坐标 -> 条目序号。
+
+        必须同时校验 x：卡片左右各有留白、圆角外还是透明区，只看 y 的话鼠标停在
+        菜单侧面也会把某一项点亮。
+        """
+        if not (self._pad_x <= x <= self._width - self._pad_x):
+            return -1
+        for y0, y1, idx in self._rows:
+            if y0 <= y < y1 and self.items[idx][0] == "item":
+                return idx
+        return -1
+
+    def _set_hover(self, idx):
+        if idx == self._hover:
+            return
+        self._hover = idx
+        if self.visible:
+            self._paint()
+
+    def sync_hover(self, pt=None):
+        """光标移出菜单后收不到 WM_MOUSEMOVE，由定时器兜底同步高亮"""
+        if not self.visible:
+            return
+        if pt is None:
+            pt = wintypes.POINT()
+            user32.GetCursorPos(ctypes.byref(pt))
+        if not self.contains(pt):
+            self._set_hover(-1)
+            return
+        self._set_hover(self._hit(pt.x - self.rect.left, pt.y - self.rect.top))
+
+    # -- 布局与绘制 -------------------------------------------------
+    def _layout(self, w):
+        s = self._scaled
+        pad_y, item_h, sep_h = s(6), s(30), s(9)
+        self._pad_x, self._width = s(6), w
+        y = pad_y
+        rows = []
+        for i, it in enumerate(self.items):
+            hh = sep_h if it[0] == "sep" else item_h
+            rows.append((y, y + hh, i))
+            y += hh
+        self._rows = rows
+        return y + pad_y
+
+    def _measure_size(self):
+        s = self._scaled
+        pad_x, check_w = s(6), s(22)
+        font = self._font(13)
+        with _MemDC() as dc:
+            widths = [self.measure(dc, font, it[1])
+                      for it in self.items if it[0] == "item"]
+        gdi32.DeleteObject(font)
+        w = max(max(widths or [0]) + pad_x * 2 + check_w + s(18), s(150))
+        return w, self._layout(w)
+
+    def _paint(self):
+        w = self.rect.right - self.rect.left
+        h = self.rect.bottom - self.rect.top
+        if w <= 0 or h <= 0:
+            return
+        s = self._scaled
+        radius = s(self.RADIUS)
+        pad_x, check_w = self._pad_x, s(22)
+        font = self._font(13)
+
+        with _Surface(w, h) as surf:
+            dc = surf.mem
+            self._draw_card(dc, w, h, radius)
+            gdi32.SetBkMode(dc, TRANSPARENT)
+            gdi32.SelectObject(dc, font)
+            gdi32.SetTextColor(dc, RGB(*CLR_TITLE))
+
+            for y0, y1, idx in self._rows:
+                it = self.items[idx]
+                if it[0] == "sep":
+                    self._hline(dc, pad_x + s(6), w - pad_x - s(6), (y0 + y1) // 2)
+                    continue
+                if idx == self._hover:
+                    self._fill_round(dc, pad_x, y0, w - pad_x, y1, s(4), CLR_HOVER)
+                if it[3]:
+                    self._check_mark(dc, pad_x + s(7), (y0 + y1) // 2)
+                user32.DrawTextW(dc, it[1], -1, ctypes.byref(wintypes.RECT(
+                    pad_x + check_w + s(4), y0, w - pad_x - s(10), y1)),
+                    DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER)
+
+            gdi32.GdiFlush()
+            self._round_alpha(surf, radius)
+            self._present(surf)
+
+        gdi32.DeleteObject(font)
+
+    # -- 对外 ------------------------------------------------------
+    def show_at(self, anchor, items, dpi, align="center"):
+        self._dpi = dpi
+        self.items = items
+        self._hover = -1
+        self._show(self._place(anchor, *self._measure_size(), align=align))
+
 
 # ===================================================================== 主程序
 class App:
+    WINDOW_CLASS = "GPWBatteryTray"
+
     ID_TRAY = 1
-    ID_TIMER_HOVER = 1
+    ID_TIMER_WATCH = 1
     ID_TIMER_REFRESH = 2
+    WATCH_INTERVAL = 30       # 鼠标轮询间隔（毫秒）
     MENU_REFRESH = 1001
     MENU_AUTOSTART = 1002
     MENU_EXIT = 1003
@@ -723,22 +997,22 @@ class App:
         self.hwnd = None
         self.hicon = None
         self.popup = None
+        self.menu = None
         self.reading = None
         self.last_ok_time = 0.0
         self._lock = threading.Lock()
         self._monitor = None
         self._stop = threading.Event()
         self._wndproc_ref = None
-        self._away_ticks = 0
         self._icon_rect = wintypes.RECT(0, 0, 0, 0)
         self._icon_rect_time = 0.0
         self._icon_fallback = False
-        self._popup_shown_at = 0.0
-        self._hover_since = 0.0
-        self._pending_popup = None
-        self._wm_taskbar_created = 0
+        self._lbtn_down = False
+        self._rbtn_down = False
+        self._menu_shown_at = 0.0
         self._pending_refresh = False
-        self.preview_lock = False
+        self._wm_taskbar_created = 0
+        self._last_click_time = 0.0
         dpi = user32.GetDpiForSystem()
         self.dpi = dpi if dpi else 96
         if demo:
@@ -755,12 +1029,12 @@ class App:
         wc.cbSize = ctypes.sizeof(WNDCLASSEXW)
         wc.lpfnWndProc = self._wndproc_ref
         wc.hInstance = hinst
-        wc.lpszClassName = "GPWBatteryTray"
+        wc.lpszClassName = self.WINDOW_CLASS
         if not user32.RegisterClassExW(ctypes.byref(wc)):
             err = ctypes.get_last_error()
-            if err not in (1410,):  # 类已注册
+            if err != ERROR_CLASS_ALREADY_EXISTS:
                 raise OSError(f"RegisterClassEx 失败: {err}")
-        self.hwnd = user32.CreateWindowExW(0, "GPWBatteryTray", "GPW Battery",
+        self.hwnd = user32.CreateWindowExW(0, self.WINDOW_CLASS, APP_NAME,
                                            0, 0, 0, 0, 0, None, None, hinst, None)
         if not self.hwnd:
             raise OSError("创建消息窗口失败")
@@ -768,8 +1042,10 @@ class App:
         self._wm_taskbar_created = user32.RegisterWindowMessageW("TaskbarCreated")
         self.popup = Popup(self)
         self.popup.create()
+        self.menu = MenuPopup(self)
+        self.menu.create()
         self._add_tray_icon()
-        user32.SetTimer(self.hwnd, self.ID_TIMER_HOVER, 60, None)
+        user32.SetTimer(self.hwnd, self.ID_TIMER_WATCH, self.WATCH_INTERVAL, None)
         user32.SetTimer(self.hwnd, self.ID_TIMER_REFRESH, 1000, None)
         self._start_monitor()
         return self
@@ -867,20 +1143,38 @@ class App:
         return None
 
     # -- 菜单 ------------------------------------------------------
-    def _show_menu(self):
-        menu = user32.CreatePopupMenu()
-        user32.AppendMenuW(menu, MF_STRING, self.MENU_REFRESH, "刷新电量")
-        checked = MF_CHECKED if self._autostart_enabled() else 0
-        user32.AppendMenuW(menu, MF_STRING | checked, self.MENU_AUTOSTART, "开机自启动")
-        user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
-        user32.AppendMenuW(menu, MF_STRING, self.MENU_EXIT, "退出")
+    def _menu_items(self):
+        return [
+            ("item", "刷新电量", self.MENU_REFRESH, False),
+            ("item", "开机自启动", self.MENU_AUTOSTART, self._autostart_enabled()),
+            ("sep", "", 0, False),
+            ("item", "退出", self.MENU_EXIT, False),
+        ]
+
+    def _anchor_rect(self):
+        """托盘图标屏幕矩形；图标在隐藏区或坐标无效时退化为光标附近"""
+        rc = self.icon_rect(max_age=0)
+        if rc and not self._icon_fallback:
+            return rc
         pt = wintypes.POINT()
         user32.GetCursorPos(ctypes.byref(pt))
-        user32.SetForegroundWindow(self.hwnd)
-        user32.TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pt.x, pt.y, 0,
-                              self.hwnd, None)
-        user32.PostMessageW(self.hwnd, WM_NULL, 0, 0)
-        user32.DestroyMenu(menu)
+        size = max(16, user32.GetSystemMetrics(SM_CXSMICON))
+        return wintypes.RECT(pt.x - size // 2, pt.y - size // 2,
+                             pt.x + size // 2, pt.y + size // 2)
+
+    def _show_menu(self):
+        # 右键菜单弹出时，左键弹窗必须让位
+        self.popup.hide()
+        self._menu_shown_at = time.time()
+        self.menu.show_at(self._anchor_rect(), self._menu_items(), self.dpi)
+
+    def _on_menu_command(self, cmd):
+        if cmd == self.MENU_REFRESH:
+            self.refresh()
+        elif cmd == self.MENU_AUTOSTART:
+            self._toggle_autostart()
+        elif cmd == self.MENU_EXIT:
+            self.quit()
 
     # -- 开机自启 --------------------------------------------------
     # 注意：这里刻意不使用「启动文件夹 + PowerShell 创建快捷方式」的老做法。
@@ -962,8 +1256,8 @@ class App:
         self._monitor = threading.Thread(target=loop, name="battery-monitor", daemon=True)
         self._monitor.start()
 
-    def refresh(self, force=False):
-        """立刻重新读一次（弹窗显示时用）"""
+    def refresh(self):
+        """立刻重新读一次（弹窗显示 / 手动刷新时用）"""
         if self.demo or self._pending_refresh:
             return
         self._pending_refresh = True
@@ -980,105 +1274,77 @@ class App:
 
         threading.Thread(target=work, daemon=True).start()
 
-    # -- 悬停逻辑 --------------------------------------------------
-    HOVER_DELAY = 0.5   # 鼠标停留多久才弹出（秒）
+    # -- 点击 / 收起 ------------------------------------------------
+    @staticmethod
+    def _button_pressed(vk, was_down):
+        """
+        这一次轮询期间有没有按下该键。
 
-    def _on_hover_timer(self):
-        if not self.hwnd or self.preview_lock:
+        两路信号缺一不可：
+        * `0x0001`（自上次调用以来按下过）—— 抓得住落在两次轮询之间的极快点击，
+          但它会被「激活式点击」吃掉：点在非前台窗口上时系统先走激活流程，
+          这个标志位有时不会置起来，只剩 `0x8000`。
+        * 当前是否按住 + 与上次轮询比较的边沿 —— 激活式点击靠它兜底。
+        """
+        state = user32.GetAsyncKeyState(vk)
+        down = bool(state & 0x8000)
+        return bool(state & 0x0001) or (down and not was_down), down
+
+    def _on_watch_timer(self):
+        """
+        轮询：左键/右键点在弹窗、菜单外面就收起。
+
+        不用全局鼠标钩子（SetWindowsHookEx / WH_MOUSE_LL），避免被安全软件
+        当成可疑行为。轮询间隔取 30ms，比常见的一次点击（80~150ms）短得多，
+        两路信号都能稳定命中（见 `_button_pressed`）。
+        """
+        if not self.hwnd:
             return
         pt = wintypes.POINT()
         user32.GetCursorPos(ctypes.byref(pt))
+        # 两个按键状态始终跟着刷新，避免弹窗出现时拿到过期的「上一次是否按住」
+        l_pressed, self._lbtn_down = self._button_pressed(VK_LBUTTON, self._lbtn_down)
+        r_pressed, self._rbtn_down = self._button_pressed(VK_RBUTTON, self._rbtn_down)
+        if not (self.popup.visible or self.menu.visible):
+            return
+        if not (l_pressed or r_pressed):
+            if self.menu.visible:
+                self.menu.sync_hover(pt)
+            return
+
         rc = self.icon_rect()
-        # 图标在「隐藏的图标」里时坐标不可信，不参与悬停判定（改由系统悬停通知驱动）
-        over_icon = (not self._icon_fallback) and bool(rc) and \
-            user32.PtInRect(ctypes.byref(rc), pt)
-        over_popup = self.popup.contains(pt)
+        over_icon = bool(rc) and not self._icon_fallback and \
+            bool(user32.PtInRect(ctypes.byref(rc), pt))
 
-        # 1) 图标可见：停留满 HOVER_DELAY 才弹出
-        if over_icon and not self.popup.visible:
-            if not self._hover_since:
-                self._hover_since = time.time()
-            elif time.time() - self._hover_since >= self.HOVER_DELAY:
-                self._hover_since = 0.0
-                self._show_popup()
-                self._away_ticks = 0
-            return
-        if not over_icon:
-            self._hover_since = 0.0
+        if l_pressed:
+            if self.menu.visible and not self.menu.contains(pt):
+                self.menu.hide()
+            elif self.popup.visible and not self.popup.contains(pt) and not over_icon:
+                self.popup.hide()
 
-        # 2) 图标在隐藏区：系统悬停通知给出的待弹出任务
-        if self._pending_popup is not None:
-            deadline, anchor = self._pending_popup
-            if self.popup.visible:
-                self._pending_popup = None
-            elif time.time() >= deadline:
-                self._pending_popup = None
-                self._show_popup(anchor=anchor)
-                self._away_ticks = 0
-            else:
-                tol = self._scaled(24)
-                if not (anchor.left - tol <= pt.x <= anchor.right + tol and
-                        anchor.top - tol <= pt.y <= anchor.bottom + tol):
-                    self._pending_popup = None   # 鼠标移开了，取消弹出
+        # 右键：弹窗上一律收起；菜单上只认菜单外面的右键。
+        # 菜单本身就是右键点出来的，那次按键要排除掉（over_icon + 刚弹出的时间窗）。
+        if r_pressed and not over_icon:
+            if self.menu.visible:
+                if not self.menu.contains(pt) and \
+                        time.time() - self._menu_shown_at > 0.25:
+                    self.menu.hide()
+            elif self.popup.visible:
+                self.popup.hide()
 
-        # 3) 自动隐藏
-        if not self.popup.visible:
-            return
-        if over_icon or over_popup:
-            self._away_ticks = 0
-            return
-        # 刚弹出时给一点缓冲，避免鼠标还在图标上就被判定离开
-        if time.time() - self._popup_shown_at < 0.8:
-            return
-        self._away_ticks += 1
-        if self._away_ticks >= 3:  # ~360ms
-            self.popup.hide()
-            self._away_ticks = 0
+        # 光标移出菜单后收不到 WM_MOUSEMOVE，这里补一次悬停高亮同步
+        if self.menu.visible:
+            self.menu.sync_hover(pt)
 
-    def _scaled(self, v):
-        return int(round(v * self.dpi / 96.0))
-
-    def _schedule_popup_at_cursor(self):
-        """悬停通知到达：延时 HOVER_DELAY 后再弹出（锚点先记下来）"""
-        if self.popup.visible:
-            return
-        pt = wintypes.POINT()
-        user32.GetCursorPos(ctypes.byref(pt))
-        size = max(16, user32.GetSystemMetrics(SM_CXSMICON))
-        anchor = wintypes.RECT(pt.x - size // 2, pt.y - size // 2,
-                               pt.x + size // 2, pt.y + size // 2)
-        self._pending_popup = (time.time() + self.HOVER_DELAY, anchor)
-
-    def _show_popup(self, anchor=None, at_cursor=False):
-        rc = anchor
-        if rc is None:
-            rc = self.icon_rect(max_age=0)
-            if at_cursor or self._icon_fallback or not rc:
-                # 用光标位置当锚点（图标在隐藏区域时最可靠）
-                pt = wintypes.POINT()
-                user32.GetCursorPos(ctypes.byref(pt))
-                size = max(16, user32.GetSystemMetrics(SM_CXSMICON))
-                rc = wintypes.RECT(pt.x - size // 2, pt.y - size // 2,
-                                   pt.x + size // 2, pt.y + size // 2)
-        if not rc:
-            return
+    def _show_popup(self):
+        """左键弹出：锚点取托盘图标矩形，显示在图标正上方"""
         with self._lock:
             reading = self.reading
-        self.popup.show_at(rc, reading, self.dpi, align="center")
-        self._popup_shown_at = time.time()
-        self._away_ticks = 0
+        self.menu.hide()
+        self.popup.show_at(self._anchor_rect(), reading, self.dpi, align="center")
         # 数据超过 10 秒则顺手刷新一次
         if not self.demo and (time.time() - self.last_ok_time > 10 or reading is None):
             self.refresh()
-
-    def _on_popup_close(self):
-        """系统通知鼠标已离开托盘图标"""
-        if not self.popup.visible:
-            return
-        pt = wintypes.POINT()
-        user32.GetCursorPos(ctypes.byref(pt))
-        if not self.popup.contains(pt):
-            self.popup.hide()
 
     # -- 消息循环 --------------------------------------------------
     def _wnd_proc(self, hwnd, msg, wparam, lparam):
@@ -1093,24 +1359,25 @@ class App:
             if msg == WM_TRAY:
                 evt = lparam & 0xFFFF
                 if evt in (WM_RBUTTONUP, WM_CONTEXTMENU):
+                    # 右键：先收起左键弹窗，再弹出同风格自绘菜单
                     self._show_menu()
                     return 0
-                if evt in (NIN_POPUPOPEN,):
-                    # 鼠标悬停到图标上（图标在隐藏区域时也能收到）→ 延时后弹出
-                    self._schedule_popup_at_cursor()
-                    return 0
-                if evt in (NIN_POPUPCLOSE,):
-                    self._pending_popup = None
-                    self._on_popup_close()
-                    return 0
                 if evt in (WM_LBUTTONUP, NIN_SELECT, WM_LBUTTONDBLCLK):
-                    # 点击是明确操作，立即弹出
-                    self._pending_popup = None
-                    self._hover_since = 0.0
+                    # 左键：切换弹窗（悬停不再触发）
+                    #
+                    # 注意：NOTIFYICON_VERSION_4 下，一次左键点击 Shell 会连发
+                    # WM_LBUTTONUP 和 NIN_SELECT 两个事件，若都执行切换，弹窗
+                    # 会「刚弹出就被自己关掉」。这里按时间做去抖，只认第一次。
+                    now = time.time()
+                    if now - self._last_click_time < 0.25:
+                        return 0
+                    self._last_click_time = now
+                    if self.menu.visible:
+                        self.menu.hide()
                     if self.popup.visible:
                         self.popup.hide()
                     else:
-                        self._show_popup(at_cursor=True)
+                        self._show_popup()
                     return 0
                 return 0
             if msg == WM_COMMAND:
@@ -1123,8 +1390,8 @@ class App:
                     self.quit()
                 return 0
             if msg == WM_TIMER:
-                if wparam == self.ID_TIMER_HOVER:
-                    self._on_hover_timer()
+                if wparam == self.ID_TIMER_WATCH:
+                    self._on_watch_timer()
                 elif wparam == self.ID_TIMER_REFRESH:
                     if self._pending_refresh is False and not self.demo:
                         with self._lock:
@@ -1142,13 +1409,14 @@ class App:
                 self.quit()
                 return 0
         except Exception as e:
-            print("wndproc 异常:", e, file=sys.stderr)
+            # 窗口过程里的异常如果只 print 到 stderr，打包成无控制台 exe 后就彻底消失了
+            _log_exception(e)
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
     def quit(self):
         self._stop.set()
         if self.hwnd:
-            user32.KillTimer(self.hwnd, self.ID_TIMER_HOVER)
+            user32.KillTimer(self.hwnd, self.ID_TIMER_WATCH)
             user32.KillTimer(self.hwnd, self.ID_TIMER_REFRESH)
             self._remove_tray_icon()
             self.hwnd_destroyed = True
@@ -1221,10 +1489,12 @@ def main(argv):
     except Exception as e:
         _log_exception(e)
         return 1
-    if "--preview" in argv:
-        # 直接显示弹窗并 15 秒后退出（用于截图检查样式）
-        app.preview_lock = True
-        app._show_popup()
+    if "--preview" in argv or "--preview-menu" in argv:
+        # 直接显示弹窗/菜单并 15 秒后退出（用于截图检查样式）
+        if "--preview-menu" in argv:
+            app._show_menu()
+        else:
+            app._show_popup()
         threading.Timer(15.0, lambda: user32.PostMessageW(app.hwnd, WM_COMMAND,
                                                            app.MENU_EXIT, 0)).start()
     try:
